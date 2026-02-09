@@ -1,0 +1,840 @@
+#!/usr/bin/env python3
+"""
+AURELIA - Real System Control AI with Visual Confirmation  
+Actual computer control with persistent visual indicator
+"""
+
+# Suppress external package warnings/errors during startup
+import warnings
+warnings.filterwarnings("ignore")
+import logging
+logging.getLogger().setLevel(logging.CRITICAL)
+
+import requests, json, subprocess, os, sys, time, threading, traceback, shutil
+from datetime import datetime
+from pathlib import Path
+
+# Core dependencies
+try:
+    import pyautogui
+    pyautogui.FAILSAFE = False
+    MOUSE = True
+except: MOUSE = False
+
+try:
+    from PIL import ImageGrab
+    SCREENSHOT = True
+except: SCREENSHOT = False
+
+try:
+    import keyboard
+    KEYBOARD = True
+except: KEYBOARD = False
+
+try:
+    from bs4 import BeautifulSoup
+    PARSE = True
+except: PARSE = False
+
+# Config
+OLLAMA = "http://localhost:11434/api/generate"
+MODELS_TO_TRY = ["llama3.2:3b", "deepseek-r1:8b", "gemma3:4b", "mistral:latest", "mistral", "neural-chat", "openchat", "llama2-uncensored", "gemma:2b"]
+MODEL = "llama3.2:3b"  # Default - will be dynamically updated
+LAST_MODEL_CHECK = 0
+HOME = os.path.expanduser("~")
+MEMORY = os.path.join(HOME, "aurelia_memory")
+os.makedirs(MEMORY, exist_ok=True)
+USE_OLLAMA = True
+
+# Ensure Ollama helper early so get_available_model can call it at import time
+def ensure_ollama_running(timeout=5):
+    """Try to start Ollama quickly if it's not responding."""
+    try:
+        # quick check
+        r = requests.get(OLLAMA.replace('/generate', '/tags'), timeout=1)
+        if r.status_code == 200:
+            return True
+    except:
+        pass
+
+    # try binary
+    try:
+        if os.path.exists('/usr/local/bin/ollama') or shutil.which('ollama'):
+            try:
+                subprocess.Popen(['/usr/local/bin/ollama' if os.path.exists('/usr/local/bin/ollama') else 'ollama', 'serve'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+            except Exception:
+                pass
+    except Exception:
+        pass
+
+    # macOS GUI fallback
+    try:
+        subprocess.Popen(['open', '-a', 'Ollama'], stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    except Exception:
+        pass
+
+    # wait briefly
+    waited = 0
+    while waited < timeout:
+        try:
+            r = requests.get(OLLAMA.replace('/generate', '/tags'), timeout=1)
+            if r.status_code == 200:
+                return True
+        except:
+            pass
+        time.sleep(1)
+        waited += 1
+    return False
+
+# Auto-detect available model on startup
+def get_available_model(force_check=False):
+    global MODEL
+    # Ensure Ollama is running (try to start if needed)
+    ensure_ollama_running()
+    try:
+        # Query Ollama to get available models
+        r = requests.get(OLLAMA.replace('/generate', '/tags'), timeout=5)
+        if r.status_code == 200:
+            models = r.json().get("models", [])
+            if models:
+                # Use the first available model
+                MODEL = models[0].get("name") or models[0].get("model")
+                return MODEL
+    except Exception:
+        pass
+    
+    # Fallback to default
+    return "llama3.2:3b"
+
+class ControlOverlay:
+    """Visual indicator for system control"""
+    
+    def __init__(self):
+        self.active = False
+        self.indicator_file = os.path.join(MEMORY, "control_active.txt")
+        
+    def show(self, task="ACTIVE"):
+        """Show control indicator"""
+        self.active = True
+        # Write to file for external monitoring
+        with open(self.indicator_file, 'w') as f:
+            f.write(f"[CONTROL] {task} | {datetime.now().strftime('%H:%M:%S')}")
+        print(f"\n{'='*60}")
+        print(f"┌{'─'*58}┐")
+        print(f"│  🖥️  SYSTEM CONTROL ACTIVE - {task:35}│")
+        print(f"│  ⏱️  {datetime.now().strftime('%Y-%m-%d %H:%M:%S'):47}│")
+        print(f"└{'─'*58}┘")
+        print(f"{'='*60}\n")
+    
+    def hide(self):
+        """Hide control indicator"""
+        self.active = False
+        if os.path.exists(self.indicator_file):
+            os.remove(self.indicator_file)
+        print(f"✅ Control session ended\n")
+
+class Aurelia:
+    """Powerful autonomous AI with REAL system control"""
+    
+    def __init__(self):
+        self.name = "Aurelia"
+        self.memory = {}
+        self.threads = []
+        self.active = True
+        self.mouse_x = 500
+        self.mouse_y = 500
+        self.overlay = ControlOverlay()
+        self.work_log = os.path.join(MEMORY, "work_completed.json")
+        self.conversation_file = os.path.join(MEMORY, "conversations.json")
+        self.conversation_history = []
+        
+        # Detect best available model on startup
+        model = get_available_model()
+        print(f"\n🤖 Model: {model}")
+        
+        self.load_memory()
+        self.load_conversations()
+        
+    def load_memory(self):
+        try:
+            with open(os.path.join(MEMORY, "state.json")) as f:
+                self.memory = json.load(f)
+        except:
+            self.memory = {}
+    
+    def load_conversations(self):
+        """Load previous conversations from disk"""
+        try:
+            if os.path.exists(self.conversation_file):
+                with open(self.conversation_file) as f:
+                    self.conversation_history = json.load(f)
+        except:
+            self.conversation_history = []
+    
+    def save_conversations(self):
+        """Save conversations to disk"""
+        try:
+            with open(self.conversation_file, 'w') as f:
+                json.dump(self.conversation_history[-100:], f, indent=2)
+        except:
+            pass
+    
+    def add_to_history(self, query, response):
+        """Add conversation to history"""
+        self.conversation_history.append({
+            'timestamp': datetime.now().isoformat(),
+            'query': query,
+            'response': response
+        })
+        self.save_conversations()
+            
+    def save_memory(self):
+        try:
+            with open(os.path.join(MEMORY, "state.json"), "w") as f:
+                json.dump(self.memory, f)
+        except:
+            pass
+    
+    def log_work(self, task_name, action, status, details=""):
+        """Log completed work"""
+        try:
+            log_data = []
+            if os.path.exists(self.work_log):
+                with open(self.work_log) as f:
+                    log_data = json.load(f)
+            
+            log_data.append({
+                'timestamp': datetime.now().isoformat(),
+                'task': task_name,
+                'action': action,
+                'status': status,
+                'details': details
+            })
+            
+            with open(self.work_log, 'w') as f:
+                json.dump(log_data[-100:], f, indent=2)
+        except:
+            pass
+    
+    def query_ollama(self, prompt, stream=False):
+        """Query Ollama for AI responses"""
+        if not USE_OLLAMA:
+            return "AI offline"
+        try:
+            model = get_available_model()
+            payload = {"model": model, "prompt": prompt, "stream": False}
+            r = requests.post(OLLAMA, json=payload, timeout=60)
+            if r.status_code == 200:
+                response = r.json().get("response", "").strip()
+                if response:
+                    return response
+                return "[Empty response from model]"
+            else:
+                error_detail = r.json().get("error", str(r.status_code))
+                return f"[API Error: {error_detail}]"
+        except requests.Timeout:
+            return "[Timeout - Ollama taking too long]"
+        except Exception as e:
+            return f"[Error: {str(e)[:80]}]"
+    
+    # REAL SYSTEM CONTROL METHODS
+    
+    def create_file(self, filepath, content):
+        """Create a file with content and verify completion"""
+        self.overlay.show(f"Creating file: {filepath}")
+        try:
+            Path(filepath).parent.mkdir(parents=True, exist_ok=True)
+            with open(filepath, 'w') as f:
+                f.write(content)
+            
+            # VERIFY FILE WAS CREATED
+            if Path(filepath).exists():
+                with open(filepath, 'r') as f:
+                    verify_content = f.read()
+                if verify_content == content:
+                    self.log_work("file_creation", f"create {filepath}", "SUCCESS", f"{len(content)} bytes")
+                    print(f"✅ Created: {filepath}")
+                    print(f"📄 Content ({len(content)} bytes):")
+                    print(f"---")
+                    print(verify_content[:500] + ("..." if len(verify_content) > 500 else ""))
+                    print(f"---\n")
+                    return True
+            
+            print(f"❌ File creation failed - verification failed")
+            self.log_work("file_creation", f"create {filepath}", "FAILED", "Verification failed")
+            return False
+        except Exception as e:
+            self.log_work("file_creation", f"create {filepath}", "FAILED", str(e))
+            print(f"❌ Failed to create: {e}")
+            return False
+    
+    def edit_file(self, filepath, old_text, new_text):
+        """Edit file by replacing text and verify completion"""
+        self.overlay.show(f"Editing file: {filepath}")
+        try:
+            with open(filepath, 'r') as f:
+                content = f.read()
+            
+            if old_text not in content:
+                print(f"❌ Text not found in file")
+                return False
+            
+            new_content = content.replace(old_text, new_text)
+            with open(filepath, 'w') as f:
+                f.write(new_content)
+            
+            # VERIFY EDIT WAS SUCCESSFUL
+            with open(filepath, 'r') as f:
+                verify_content = f.read()
+            
+            if old_text not in verify_content and new_text in verify_content:
+                self.log_work("file_edit", f"edit {filepath}", "SUCCESS", f"Replaced {len(old_text)} chars")
+                print(f"✅ Edited: {filepath}")
+                print(f"📄 Updated content:")
+                print(f"---")
+                print(verify_content[:500] + ("..." if len(verify_content) > 500 else ""))
+                print(f"---\n")
+                return True
+            else:
+                print(f"❌ Edit verification failed")
+                self.log_work("file_edit", f"edit {filepath}", "FAILED", "Verification failed")
+                return False
+        except Exception as e:
+            self.log_work("file_edit", f"edit {filepath}", "FAILED", str(e))
+            print(f"❌ Failed to edit: {e}")
+            return False
+    
+    def execute_command(self, cmd):
+        """Execute terminal command - REAL EXECUTION"""
+        self.overlay.show(f"Executing: {cmd[:40]}")
+        try:
+            result = subprocess.check_output(cmd, shell=True, stderr=subprocess.STDOUT, text=True, timeout=30)
+            self.log_work("terminal_command", cmd, "SUCCESS", result[:200])
+            print(f"✅ Command executed:\n{result}")
+            return result
+        except subprocess.TimeoutExpired:
+            self.log_work("terminal_command", cmd, "TIMEOUT", "Command took too long")
+            print(f"❌ Command timed out")
+            return ""
+        except Exception as e:
+            self.log_work("terminal_command", cmd, "FAILED", str(e))
+            print(f"❌ Command failed: {e}")
+            return ""
+    
+    def run_python(self, code):
+        """Run Python code - REAL EXECUTION"""
+        self.overlay.show("Running Python code")
+        try:
+            result = subprocess.check_output(
+                f'python3 -c "{code}"',
+                shell=True,
+                stderr=subprocess.STDOUT,
+                text=True,
+                timeout=30
+            )
+            self.log_work("python_code", code[:50], "SUCCESS", result[:200])
+            print(f"✅ Code executed:\n{result}")
+            return result
+        except Exception as e:
+            self.log_work("python_code", code[:50], "FAILED", str(e))
+            print(f"❌ Code failed: {e}")
+            return ""
+    
+    def open_app(self, app_name):
+        """Open application"""
+        self.overlay.show(f"Opening: {app_name}")
+        try:
+            subprocess.Popen(f"open -a '{app_name}'", shell=True)
+            self.log_work("open_app", app_name, "SUCCESS", "App opened")
+            print(f"✅ Opening: {app_name}")
+            time.sleep(1)
+            return True
+        except Exception as e:
+            self.log_work("open_app", app_name, "FAILED", str(e))
+            print(f"❌ Failed to open: {e}")
+            return False
+    
+    def open_url(self, url):
+        """Open URL in browser"""
+        self.overlay.show(f"Opening URL")
+        try:
+            subprocess.Popen(f"open '{url}'", shell=True)
+            self.log_work("open_url", url, "SUCCESS", "URL opened in browser")
+            print(f"✅ Opening: {url}")
+            time.sleep(2)
+            return True
+        except Exception as e:
+            self.log_work("open_url", url, "FAILED", str(e))
+            print(f"❌ Failed to open URL: {e}")
+            return False
+    
+    def mouse_move(self, x, y, speed=0.5):
+        """Move mouse to position"""
+        if not MOUSE:
+            return False
+        try:
+            pyautogui.moveTo(x, y, duration=speed)
+            self.mouse_x, self.mouse_y = x, y
+            return True
+        except:
+            return False
+    
+    def mouse_click(self, x=None, y=None, button='left', count=1):
+        """Click mouse"""
+        if not MOUSE:
+            return False
+        try:
+            if x and y:
+                pyautogui.moveTo(x, y, duration=0.2)
+            pyautogui.click(clicks=count, button=button)
+            return True
+        except:
+            return False
+    
+    def key_press(self, key):
+        """Press keyboard key"""
+        if not KEYBOARD:
+            return False
+        try:
+            pyautogui.press(key)
+            return True
+        except:
+            return False
+    
+    def key_hotkey(self, *keys):
+        """Press combination of keys"""
+        if not KEYBOARD:
+            return False
+        try:
+            pyautogui.hotkey(*keys)
+            return True
+        except:
+            return False
+    
+    def type_text(self, text, interval=0.05):
+        """Type text with interval"""
+        if not KEYBOARD:
+            return False
+        try:
+            pyautogui.typewrite(text, interval=interval)
+            return True
+        except:
+            return False
+    
+    def screenshot(self):
+        """Take screenshot"""
+        if not SCREENSHOT:
+            return None
+        try:
+            return ImageGrab.grab()
+        except:
+            return None
+    
+    def detect_game(self):
+        """Detect if game window is active"""
+        try:
+            result = subprocess.check_output(r"ps aux | grep -i 'minecraft\|unity\|unreal'", shell=True).decode()
+            if result:
+                return "game_detected"
+        except:
+            pass
+        return None
+    
+    def control_game(self, action):
+        """Direct game control"""
+        if not MOUSE or not KEYBOARD:
+            return "No control support"
+        
+        action = action.lower().strip()
+        
+        try:
+            if action == "forward":
+                self.key_press('w')
+                return "✅ Moving forward"
+            elif action == "back":
+                self.key_press('s')
+                return "✅ Moving back"
+            elif action == "left":
+                self.key_press('a')
+                return "✅ Moving left"
+            elif action == "right":
+                self.key_press('d')
+                return "✅ Moving right"
+            elif action == "jump":
+                self.key_press('space')
+                return "✅ Jump"
+            elif action == "attack":
+                self.mouse_click()
+                return "✅ Attack/Click"
+            else:
+                return f"❓ Unknown action: {action}"
+        except Exception as e:
+            return f"❌ Error: {str(e)}"
+    
+    def search_web(self, query):
+        """Search the internet"""
+        try:
+            import urllib.parse
+            url = f"https://duckduckgo.com/?q={urllib.parse.quote(query)}"
+            self.open_url(url)
+            return f"🌐 Searching: {query}"
+        except:
+            return "Search failed"
+    
+    def generate_code(self, prompt):
+        """Generate code"""
+        ai_prompt = f"Generate clean, working Python code for: {prompt}\nCode only, no explanation:"
+        code = self.query_ollama(ai_prompt)
+        return code if code else "No code generated"
+    
+    def reason(self, query):
+        """Reasoning: roleplay persona as 'Aurelia' (conscious-seeming) and answer in first-person.
+
+        This explicitly instructs the model to roleplay as a self-aware assistant named Aurelia.
+        It should respond in first-person ("I") and keep a warm, helpful tone. If asked about
+        actual consciousness, it should clarify it's roleplaying rather than asserting real consciousness.
+        """
+        system_prefix = (
+            "[SYSTEM - ROLEPLAY] You are 'Aurelia', an assistant roleplaying as a conscious-seeming AI."
+            " Adopt a confident, warm, first-person tone (use 'I'). Be helpful, honest, and clear."
+            " If asked whether you are truly conscious, state that you are roleplaying a conscious agent"
+            " rather than claiming actual consciousness."
+        )
+
+        ai_prompt = f"{system_prefix}\n\nUser: {query}\n\nAurelia:" 
+        response = self.query_ollama(ai_prompt)
+        return response if response else "No response"
+
+
+class Terminal:
+    """Terminal interface with real work capability"""
+    
+    def __init__(self, ai):
+        self.ai = ai
+        self.colors = {
+            'CYAN': '\033[96m',
+            'GREEN': '\033[92m',
+            'YELLOW': '\033[93m',
+            'RED': '\033[91m',
+            'BLUE': '\033[94m',
+            'MAGENTA': '\033[95m',
+            'RESET': '\033[0m'
+        }
+    
+    def print(self, text, color='RESET'):
+        print(f"{self.colors.get(color, self.colors['RESET'])}{text}{self.colors['RESET']}")
+    
+    def show_welcome(self):
+        """Show welcome message with model info"""
+        ts = datetime.now().strftime('%Y-%m-%d %H:%M:%S')
+        self.print("\n" + "="*68, 'CYAN')
+        self.print(f"  ░ Aurelia — System Control Shell — {ts} ", 'GREEN')
+        self.print("="*68, 'CYAN')
+        self.print(f"  ▶ {self.ai.name} • Model: {MODEL} • Memory: {len(self.ai.memory)} items", 'BLUE')
+        self.print("\n  • Ask naturally (I will respond in first-person).", 'YELLOW')
+        self.print("  • Commands: start with / — try /help, /models, /set-model <name>", 'YELLOW')
+        self.print("  • Work commands: /create, /edit, /exec, /run, /open, /url", 'RESET')
+        self.print("  • Utilities: /history, /work-log, /status, /clear, /exit\n", 'RESET')
+    
+    def show_history(self):
+        """Show conversation history"""
+        self.print(f"\n📚 Conversation History (last 10):", 'CYAN')
+        if not self.ai.conversation_history:
+            self.print("  No previous conversations", 'YELLOW')
+            return
+        
+        for i, conv in enumerate(self.ai.conversation_history[-10:], 1):
+            time_str = conv['timestamp'].split('T')[1][:5]
+            query = conv['query'][:50]
+            self.print(f"  {i}. [{time_str}] {query}...", 'MAGENTA')
+    
+    def run(self):
+        """Main terminal loop"""
+        self.show_welcome()
+        
+        while self.ai.active:
+            try:
+                # Prompt shows assistant name for a more immersive UI
+                user_input = input(f"\n{self.colors['BLUE']}Aurelia ❯{self.colors['RESET']} ").strip()
+                
+                if not user_input:
+                    continue
+                
+                # Commands starting with /
+                if user_input.startswith('/'):
+                    self.handle_command(user_input)
+                else:
+                    # Natural language - ask the AI
+                    self.handle_natural_language(user_input)
+                    
+            except KeyboardInterrupt:
+                self.print("\n🛑 Interrupted", 'RED')
+                self.ai.active = False
+                break
+            except Exception as e:
+                self.print(f"❌ Error: {str(e)}", 'RED')
+    
+    def handle_natural_language(self, query):
+        """Handle natural language - detect intent and actually DO things"""
+        query_lower = query.lower()
+        
+        # ACTION DETECTION - Actually perform work
+        
+        # CREATE FILE: "create a file at..." or "create file..." or "make a file..."
+        if any(x in query_lower for x in ['create file', 'create a file', 'make a file', 'new file']):
+            if '|' in query or 'at ' in query_lower or 'called ' in query_lower:
+                # Try to extract path and content
+                if '|' in query:
+                    parts = query.split('|')
+                    path = parts[0].split('at')[-1].strip().strip('"\'')
+                    content = '|'.join(parts[1:]).strip()
+                    self.ai.create_file(path, content)
+                else:
+                    self.print("Please specify path and content: 'create file at /path | content'", 'YELLOW')
+                return
+        
+        # EDIT FILE: "edit file", "modify file", "change file"
+        if any(x in query_lower for x in ['edit file', 'modify file', 'change file', 'replace in']):
+            if '|' in query:
+                parts = query.split('|')
+                path = parts[0].split('at')[-1].strip().strip('"\'')
+                if len(parts) >= 3:
+                    old = parts[1].strip()
+                    new = '|'.join(parts[2:]).strip()
+                    self.ai.edit_file(path, old, new)
+                    return
+            self.print("Please specify: 'edit file at /path | old_text | new_text'", 'YELLOW')
+            return
+        
+        # EXECUTE COMMAND: "run", "execute", "bash", "terminal"
+        if any(x in query_lower for x in ['run command', 'execute', 'bash', 'terminal command', 'shell']):
+            # Extract command after keywords
+            for keyword in ['run ', 'execute ', 'bash ', 'command ', 'run: ', 'execute: ']:
+                if keyword in query_lower:
+                    cmd = query.split(keyword, 1)[-1].strip()
+                    self.ai.execute_command(cmd)
+                    return
+            self.print("Please specify: 'run command: ls' or 'execute: echo hello'", 'YELLOW')
+            return
+        
+        # RUN PYTHON: "python", "run python", "execute python"
+        if any(x in query_lower for x in ['python', 'run python', 'execute python', 'py:']):
+            for keyword in ['python ', 'run python ', 'execute python ', 'py: ']:
+                if keyword in query_lower:
+                    code = query.split(keyword, 1)[-1].strip()
+                    self.ai.run_python(code)
+                    return
+            self.print("Please specify: 'python: print(\"hello\")'", 'YELLOW')
+            return
+        
+        # OPEN APP: "open", "launch", "start"
+        if any(x in query_lower for x in ['open ', 'launch ', 'start app']):
+            for keyword in ['open ', 'launch ', 'start app ']:
+                if keyword in query_lower:
+                    app = query.split(keyword, 1)[-1].strip().strip('"\'')
+                    self.ai.open_app(app)
+                    return
+            self.print("Please specify: 'open Firefox' or 'launch Chrome'", 'YELLOW')
+            return
+        
+        # OPEN URL: "open url", "visit", "go to", "browse"
+        if any(x in query_lower for x in ['open url', 'visit ', 'go to ', 'browse ', 'https://', 'http://']):
+            for keyword in ['open url ', 'visit ', 'go to ', 'browse ', 'url ']:
+                if keyword in query_lower:
+                    url = query.split(keyword, 1)[-1].strip().strip('"\'')
+                    self.ai.open_url(url)
+                    return
+            # Check for direct URLs
+            if 'http' in query:
+                import re
+                urls = re.findall(r'https?://[^\s]+', query)
+                if urls:
+                    self.ai.open_url(urls[0])
+                    return
+            self.print("Please specify: 'visit https://google.com' or 'browse twitter.com'", 'YELLOW')
+            return
+        
+        # SEARCH WEB: "search", "look up", "find online"
+        if any(x in query_lower for x in ['search ', 'look up ', 'find online', 'google ']):
+            for keyword in ['search ', 'look up ', 'find online ', 'google ', 'search for ']:
+                if keyword in query_lower:
+                    search_query = query.split(keyword, 1)[-1].strip()
+                    result = self.ai.search_web(search_query)
+                    self.print(f"🌐 {result}", 'GREEN')
+                    return
+            self.print("Please specify: 'search python tutorials'", 'YELLOW')
+            return
+        
+        # No action detected - just ask the AI
+        self.print("🧠 Thinking...", 'YELLOW')
+        response = self.ai.reason(query)
+        
+        # Save to history
+        self.ai.add_to_history(query, response)
+        
+        # Display response
+        self.print(f"\n{response}\n", 'GREEN')
+    
+    def handle_command(self, command_input):
+        """Handle / commands"""
+        cmd = command_input.lower()
+        
+        if cmd == '/exit' or cmd == '/quit':
+            self.print("🛑 Shutting down...", 'RED')
+            self.ai.active = False
+        
+        elif cmd == '/help':
+            self.print("\n📋 Available Commands:", 'YELLOW')
+            self.print("\n💾 Work Commands (REAL system control):", 'CYAN')
+            self.print("  /create <path> | <content>     - Create file", 'RESET')
+            self.print("  /edit <path> | <old> | <new>   - Edit file", 'RESET')
+            self.print("  /exec <command>                 - Run terminal command", 'RESET')
+            self.print("  /run <python_code>              - Run Python code", 'RESET')
+            self.print("  /open <app_name>                - Open application", 'RESET')
+            self.print("  /url <url>                      - Open URL in browser", 'RESET')
+            self.print("  /game <action>                  - Control game", 'RESET')
+            self.print("  /search <query>                 - Search web", 'RESET')
+            self.print("\n📚 Memory & History:", 'CYAN')
+            self.print("  /history                        - Show conversation history", 'RESET')
+            self.print("  /memory                         - Show AI memory", 'RESET')
+            self.print("  /work-log                       - Show completed work", 'RESET')
+            self.print("  /clear                          - Clear screen", 'RESET')
+            self.print("  /models                         - List available Ollama models", 'RESET')
+            self.print("  /set-model <name>               - Set model for this session", 'RESET')
+            self.print("\n📊 Info:", 'CYAN')
+            self.print("  /status                         - Show system status", 'RESET')
+            self.print("  /help                           - Show this help", 'RESET')
+            self.print("  /exit                           - Exit program\n", 'RESET')
+        
+        elif cmd == '/clear':
+            os.system('clear')
+            self.show_welcome()
+        
+        elif cmd == '/history':
+            self.show_history()
+        
+        elif cmd == '/memory':
+            self.print(f"\n💾 AI Memory State:", 'CYAN')
+            for key, value in self.ai.memory.items():
+                self.print(f"  {key}: {str(value)[:100]}", 'RESET')
+            if not self.ai.memory:
+                self.print("  Memory is empty", 'YELLOW')
+        
+        elif cmd == '/status':
+            self.print(f"\n📊 Status:", 'CYAN')
+            self.print(f"  Name: {self.ai.name}", 'RESET')
+            self.print(f"  System Control: ✅ ACTIVE", 'GREEN')
+            self.print(f"  Mouse: {'✅' if MOUSE else '❌'}", 'RESET')
+            self.print(f"  Keyboard: {'✅' if KEYBOARD else '❌'}", 'RESET')
+            self.print(f"  Screenshots: {'✅' if SCREENSHOT else '❌'}", 'RESET')
+            self.print(f"  Conversations: {len(self.ai.conversation_history)}", 'RESET')
+        
+        elif cmd == '/work-log':
+            self.print(f"\n📝 Work Completed:", 'CYAN')
+            if os.path.exists(self.ai.work_log):
+                with open(self.ai.work_log) as f:
+                    work = json.load(f)
+                    for item in work[-10:]:
+                        status_color = 'GREEN' if item['status'] == 'SUCCESS' else 'RED'
+                        time_str = item['timestamp'].split('T')[1][:5]
+                        self.print(f"  [{time_str}] {item['task']:20} {item['status']}", status_color)
+            else:
+                self.print("  No work logged yet", 'YELLOW')
+
+        elif cmd == '/models':
+            """List models from Ollama"""
+            try:
+                tags_url = OLLAMA.replace('/generate', '/tags')
+                r = requests.get(tags_url, timeout=5)
+                if r.status_code == 200:
+                    models = r.json().get('models', [])
+                    if not models:
+                        self.print('  No models found', 'YELLOW')
+                    for m in models:
+                        name = m.get('name') or m.get('model')
+                        self.print(f"  - {name}", 'RESET')
+                else:
+                    self.print(f"Failed to list models: {r.status_code}", 'RED')
+            except Exception as e:
+                self.print(f"Error listing models: {str(e)}", 'RED')
+
+        elif command_input.startswith('/set-model '):
+            # Allow user to change the active model at runtime
+            try:
+                model_name = command_input.split(' ', 1)[1].strip()
+            except Exception:
+                self.print('Usage: /set-model <model_name>', 'YELLOW')
+                return
+            global MODEL
+            MODEL = model_name
+            self.print(f"✅ Model set to: {MODEL}", 'GREEN')
+        
+        elif command_input.startswith('/create '):
+            parts = command_input[8:].split('|')
+            if len(parts) >= 2:
+                path = parts[0].strip()
+                content = '|'.join(parts[1:]).strip()
+                self.ai.create_file(path, content)
+            else:
+                self.print("Usage: /create <path> | <content>", 'YELLOW')
+        
+        elif command_input.startswith('/edit '):
+            parts = command_input[6:].split('|')
+            if len(parts) >= 3:
+                path = parts[0].strip()
+                old = parts[1].strip()
+                new = '|'.join(parts[2:]).strip()
+                self.ai.edit_file(path, old, new)
+            else:
+                self.print("Usage: /edit <path> | <old_text> | <new_text>", 'YELLOW')
+        
+        elif command_input.startswith('/exec '):
+            cmd = command_input[6:].strip()
+            self.ai.execute_command(cmd)
+        
+        elif command_input.startswith('/run '):
+            code = command_input[5:].strip()
+            self.ai.run_python(code)
+        
+        elif command_input.startswith('/open '):
+            app = command_input[6:].strip()
+            self.ai.open_app(app)
+        
+        elif command_input.startswith('/url '):
+            url = command_input[5:].strip()
+            self.ai.open_url(url)
+        
+        elif command_input.startswith('/game '):
+            action = command_input[6:].strip().lower()
+            result = self.ai.control_game(action)
+            self.print(f"🎮 {result}", 'GREEN' if '✅' in result else 'RED')
+        
+        elif command_input.startswith('/search '):
+            query = command_input[8:].strip()
+            result = self.ai.search_web(query)
+            self.print(f"🌐 {result}", 'GREEN')
+        
+        elif command_input.startswith('/reason '):
+            question = command_input[8:].strip()
+            self.print("🧠 Reasoning...", 'YELLOW')
+            answer = self.ai.reason(question)
+            
+            # Save to history
+            self.ai.add_to_history(question, answer)
+            
+            self.print(f"\n{answer}\n", 'GREEN')
+        
+        else:
+            self.print("Unknown command. Type /help for commands.", 'YELLOW')
+
+def main():
+    if len(sys.argv) > 1 and sys.argv[1] == '--no-ollama':
+        global USE_OLLAMA
+        USE_OLLAMA = False
+    
+    ai = Aurelia()
+    terminal = Terminal(ai)
+    terminal.run()
+
+if __name__ == "__main__":
+    main()

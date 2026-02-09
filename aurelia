@@ -1,0 +1,17 @@
+#!/bin/bash
+# Aurelia - Autonomous AI System Launcher
+
+cd /Users/nayangarg/code/GemmaAI_Deployment
+
+# Install dependencies if needed
+if ! python3 -c "import pyautogui" 2>/dev/null; then
+    echo "Installing dependencies..."
+    /Users/nayangarg/code/.venv/bin/pip install -q -r requirements.txt
+fi
+
+# Run with or without Ollama
+if [ "$1" == "offline" ]; then
+    /Users/nayangarg/code/.venv/bin/python gemma_ultra.py --no-ollama
+else
+    /Users/nayangarg/code/.venv/bin/python gemma_ultra.py
+fi
